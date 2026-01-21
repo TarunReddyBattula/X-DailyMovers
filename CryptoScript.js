@@ -291,8 +291,8 @@ async function reportPerformance() {
 }
 
 // Schedules: 00:00 AM Scan | 00:15 PM Report
-cron.schedule('0 1 * * *', getUnifiedPicks);
-cron.schedule('15 1 * * *', reportPerformance);
+cron.schedule('0 8 * * *', getUnifiedPicks);
+cron.schedule('15 8 * * *', reportPerformance);
 
 // Initial start
 getUnifiedPicks();
