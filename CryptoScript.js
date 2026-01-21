@@ -3,9 +3,12 @@ const ccxt = require('ccxt');
 const { EMA, RSI, BollingerBands, PSAR, VWAP } = require('technicalindicators');
 const cron = require('node-cron');
 const axios = require('axios');
-const fs = require('fs');t
+const fs = require('fs');
 const http = require('http');
+const { TwitterApi } = require('twitter-api-v2'); // NEW: Import Twitter Library
+
 const port = process.env.PORT || 8080;
+const STORAGE_FILE = './master_picks.json';
 
 // Tiny server to keep the service alive
 http.createServer((req, res) => {
@@ -15,9 +18,16 @@ http.createServer((req, res) => {
   console.log(`[Keep-Alive] Server listening on port ${port}`);
 });
 
+// NEW: Initialize Twitter Client with User Context (OAuth 1.0a)
+const twitterClient = new TwitterApi({
+    appKey: process.env.X_API_KEY,
+    appSecret: process.env.X_API_SECRET,
+    accessToken: process.env.X_ACCESS_TOKEN,
+    accessSecret: process.env.X_ACCESS_SECRET,
+});
+
 // Updated to Kraken as per your latest preference
 const binance = new ccxt.kraken({ 'enableRateLimit': true });
-const STORAGE_FILE = './master_picks.json';
 
 // NEW: Helper function to prevent API rate limit bans
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -33,12 +43,23 @@ const WHALE_API_KEY = process.env.WHALE_ALERT_KEY;
 async function getUnifiedPicks() {
     console.log(`[${new Date().toLocaleTimeString()}] Initializing 32-Point Master Scan...`);
 
+    // Add this temporary check after initializing the twitterClient
+    const verifyUser = async () => {
+        try {
+            const user = await twitterClient.v2.me();
+            console.log("✅ Authenticated as:", user.data.username);
+        } catch (e) {
+            console.error("❌ Auth Check Failed:", e.data ? e.data.detail : e.message);
+        }
+    };
+    verifyUser();
     try {
         // --- 1. GLOBAL DATA FETCHING (Outside the loop for efficiency) ---
 
         // NEW: Fetch Comprehensive Stablecoin List from DefiLlama
         console.log("[Setup] Fetching master stablecoin list from DefiLlama...");
-        let stablecoinBlacklist = new Set(['usdt', 'usdc', 'dai', 'busd', 'fdusd', 'pyusd', 'usdg', 'rlusd']); // Fallback defaults
+        let stablecoinBlacklist = new Set(['usdt', 'usdc', 'dai', 'busd', 'fdusd', 'pyusd', 'usdg', 'rlusd']);
+        // Fallback defaults
         try {
             const llamaRes = await axios.get('https://stablecoins.llama.fi/stablecoins');
             const llamaSymbols = llamaRes.data.peggedAssets.map(s => s.symbol.toLowerCase());
@@ -53,22 +74,20 @@ async function getUnifiedPicks() {
         console.log("[Gecko] Fetching Top 500 Market Cap assets...");
         let top500BaseSymbols = [];
         try {
-            for (let page = 1; page <= 1; page++) {
+            for (let page = 1; page <= 4; page++) {
                 const geckoRes = await axios.get('https://api.coingecko.com/api/v3/coins/markets', {
                     params: {
                         vs_currency: 'usd',
                         order: 'market_cap_desc',
-                        per_page: 100,
+                        per_page: 250,
                         page: page,
                         sparkline: false
                     }
                 });
-
                 // Extract base symbols (e.g., "BTC", "ETH")
                 const filtered = geckoRes.data
                     .filter(coin => !stablecoinBlacklist.has(coin.symbol.toLowerCase()))
                     .map(coin => coin.symbol.toUpperCase());
-                
                 top500BaseSymbols.push(...filtered);
             }
         } catch (e) {
@@ -96,24 +115,20 @@ async function getUnifiedPicks() {
         } catch (e) { console.log("Whale Alert API unavailable."); }
 
         const tickers = await binance.fetchTickers();
-        
         // NEW: Dynamic Pair Discovery Logic
         // This checks for BASE/USDT, then BASE/USD, then Kraken's unique X/Z naming
         let symbols = top500BaseSymbols.map(base => {
             const options = [`${base}/USDT`, `${base}/USD`, `X${base}/ZUSD`, `${base}/XBT`];
             return options.find(pair => tickers[pair]);
         }).filter(s => s != null);
-
         console.log(`[Process] Starting scan of ${symbols.length} assets...`);
+
         let finalCandidates = [];
         let scanCount = 0;
-
         for (const symbol of symbols) {
             scanCount++;
-            
             // NEW: Respect Rate Limits (Kraken is sensitive)
-            await sleep(200); 
-
+            await sleep(200);
             try {
                 // FETCH DATA
                 const ohlcv = await binance.fetchOHLCV(symbol, '1h', undefined, 100);
@@ -125,7 +140,6 @@ async function getUnifiedPicks() {
                 const volumes = ohlcv.map(d => d[5]);
                 const coinSymbol = symbol.split('/')[0];
                 const currentPrice = tickers[symbol].last;
-
                 let score = 0;
                 let triggers = [];
 
@@ -135,7 +149,8 @@ async function getUnifiedPicks() {
                 if (mid < dailyOhlcv[0][4] && dailyOhlcv[29][4] > mid) { score += 5; triggers.push("Rounding Bottom"); }
                 
                 // 2. Ascending Triangle
-                if (lows[99] > lows[98] && lows[98] > lows[97]) { score += 4; triggers.push("Higher Lows (Triangle)"); }
+                if (lows[99] > lows[98] && lows[98] > lows[97]) { score += 4;
+                triggers.push("Higher Lows (Triangle)"); }
 
                 // 4. PSAR Flip
                 const psar = PSAR.calculate({ step: 0.02, max: 0.2, high: highs, low: lows });
@@ -171,13 +186,15 @@ async function getUnifiedPicks() {
 
                 // 13. LunarCrush Galaxy Score
                 if (socialData[coinSymbol] && socialData[coinSymbol].galaxy_score > 70) {
-                    score += 10; triggers.push(`Social: Galaxy Score ${socialData[coinSymbol].galaxy_score}`);
+                    score += 10;
+                    triggers.push(`Social: Galaxy Score ${socialData[coinSymbol].galaxy_score}`);
                 }
 
                 // 15. Whale Alert Inflow
                 const symbolWhaleMoves = whaleFlows.filter(t => t.symbol.toUpperCase() === coinSymbol);
                 if (symbolWhaleMoves.some(t => t.to.owner_type === 'exchange')) {
-                    score += 6; triggers.push("Whale Activity Detected");
+                    score += 6;
+                    triggers.push("Whale Activity Detected");
                 }
 
                 // --- V. PSYCHOLOGY ---
@@ -192,7 +209,6 @@ async function getUnifiedPicks() {
 
                 // NEW: Updated logging to prevent line disappearing and show full details
                 console.log(`Scanning: [${scanCount}/${symbols.length}] | Symbol: ${symbol} | Score: ${score} | Price: ${currentPrice.toFixed(4)} | Triggers: [${triggers.join(", ")}]`);
-
                 finalCandidates.push({ symbol, score, triggers, priceAt5am: currentPrice });
             } catch (e) { continue; }
         }
@@ -208,8 +224,37 @@ async function getUnifiedPicks() {
             Secondary: p.triggers[1] || "None"
         })));
 
+        // Wait 2 seconds before posting to avoid rate limits
+        await sleep(2000);
+        // Post top suggestions to X
+        await postSuggestionsToTwitter(top5);
+
     } catch (err) {
         console.error("Critical error during scan:", err);
+    }
+}
+
+/**
+ * NEW: Post Nightly Top 5 Suggestions to X
+ */
+async function postSuggestionsToTwitter(picks) {
+    try {
+        const timestamp = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric' });
+        let tweetText = `Nightly Crypto Scan (${timestamp})\n\n`;
+        tweetText += "Top 5 High-Score Signals:\n";
+        picks.forEach((p, i) => {
+            tweetText += `${i + 1}. ${p.symbol.split('/')[0]} Score: ${p.score} - ${p.triggers[0]}\n`;
+        });
+        
+        console.log("📝 Posting Nightly Suggestions to X...");
+        console.log("Tweet content length:", tweetText.length);
+        console.log("Tweet preview:", tweetText.substring(0, 100));
+        
+        await twitterClient.v2.tweet(tweetText);
+        console.log("✅ Nightly suggestions posted successfully!");
+    } catch (error) {
+        console.error("❌ Failed to post nightly suggestions:", error.data?.detail || error.message);
+        console.error("Full error data:", error.data);
     }
 }
 
@@ -220,19 +265,34 @@ async function reportPerformance() {
     console.log("\n--- END OF DAY PERFORMANCE REPORT ---");
     if (!fs.existsSync(STORAGE_FILE)) return;
     
-    const picks = JSON.parse(fs.readFileSync(STORAGE_FILE));
-    for (const pick of picks) {
-        try {
-            const now = await binance.fetchTicker(pick.symbol);
-            const change = ((now.last - pick.priceAt5am) / pick.priceAt5am) * 100;
-            console.log(`${pick.symbol}: Started @ ${pick.priceAt5am.toFixed(4)} -> Now @ ${now.last.toFixed(4)} | Change: ${change.toFixed(2)}% ${change >= 10 ? '✅ 10% TARGET MET' : ''}`);
-        } catch (e) { console.log(`Error tracking ${pick.symbol}`); }
+    try {
+        const picks = JSON.parse(fs.readFileSync(STORAGE_FILE));
+        let tweetText = `📊 Daily Comparison Report 📊\n\n`;
+
+        for (const pick of picks) {
+            try {
+                const now = await binance.fetchTicker(pick.symbol);
+                const change = ((now.last - pick.priceAt5am) / pick.priceAt5am) * 100;
+                const icon = change >= 0 ? '✅' : '🔻';
+                
+                console.log(`${pick.symbol}: Started @ ${pick.priceAt5am.toFixed(4)} -> Now @ ${now.last.toFixed(4)} | Change: ${change.toFixed(2)}% ${change >= 10 ? '✅ 10% TARGET MET' : ''}`);
+                tweetText += `${icon} #${pick.symbol.split('/')[0]}: ${change > 0 ? '+' : ''}${change.toFixed(2)}%\n`;
+            } catch (e) { console.log(`Error tracking ${pick.symbol}`); }
+        }
+
+        tweetText += "\n#PerformanceReview #CryptoResults";
+        
+        console.log("📝 Posting Comparison Report to X...");
+        await twitterClient.v2.tweet(tweetText);
+        console.log("✅ Comparison report posted successfully!");
+    } catch (error) {
+        console.error("❌ Failed to report performance to X:", error);
     }
 }
 
-// Schedules: 5:00 AM Scan | 11:59 PM Report
-cron.schedule('0 5 * * *', getUnifiedPicks);
-cron.schedule('59 23 * * *', reportPerformance);
+// Schedules: 00:00 AM Scan | 00:15 PM Report
+cron.schedule('0 1 * * *', getUnifiedPicks);
+cron.schedule('15 1 * * *', reportPerformance);
 
 // Initial start
 getUnifiedPicks();
